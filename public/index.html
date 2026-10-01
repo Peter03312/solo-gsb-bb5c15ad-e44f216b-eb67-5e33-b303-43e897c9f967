@@ -13,6 +13,7 @@
       <button class="tab active" data-tab="player">排演播放</button>
       <button class="tab" data-tab="records">调光记录</button>
       <button class="tab" data-tab="compare">版本比对</button>
+      <button class="tab" data-tab="merge">版本合并</button>
       <button class="tab" data-tab="load">回路负载</button>
       <button class="tab" data-tab="lights">灯具录入</button>
       <button class="tab" data-tab="cues">草稿 Cue</button>
@@ -134,6 +135,52 @@
         <div class="card">
           <h2>配置差异（仅在一版存在的灯具，不视为熄灭）</h2>
           <div id="cmp-config"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 版本合并 ============================ -->
+    <section id="tab-merge" class="tab-panel">
+      <div class="card">
+        <h2>把已发布版本合入当前草稿</h2>
+        <p class="muted">
+          两组排演从同一已发布版本各自改稿后，选择<strong>共同基线版本</strong>与<strong>待合入版本</strong>，
+          系统按灯具/回路编号、Cue 编号与灯具接线做三方比较：仅一侧改动或两侧改成相同内容的改动
+          <strong>自动合入</strong>；两侧不同改动、删除与修改并存、同编号新增异值、名称重名、
+          Cue/接线引用缺失列为<strong>冲突</strong>。预览不写库；逐项选择「保留草稿 / 采用待合入版本」后提交，
+          仍违反唯一性或引用规则将整次拒绝；预览后草稿若被编辑，需重新预览。
+          已发布版本与调光记录不受影响。
+        </p>
+        <form id="form-merge-preview" class="cue-form">
+          <label>共同基线版本
+            <select id="mg-base" required></select>
+          </label>
+          <label>待合入版本
+            <select id="mg-theirs" required></select>
+          </label>
+          <button class="primary" type="submit">预览合并</button>
+        </form>
+        <div id="merge-error" class="error-line" hidden></div>
+        <div id="merge-ok" class="ok-line" hidden></div>
+      </div>
+
+      <div id="merge-result" hidden>
+        <div class="card">
+          <h2 id="merge-title">合并预览</h2>
+          <p class="muted" id="merge-summary"></p>
+          <p class="muted" id="merge-note" hidden></p>
+          <h3>可自动合入的改动</h3>
+          <div id="merge-auto"></div>
+        </div>
+
+        <div class="card">
+          <h2>冲突（逐项选择保留草稿或采用待合入版本）</h2>
+          <div id="merge-conflicts"></div>
+          <div class="row">
+            <button id="btn-merge-commit" class="primary">✅ 提交合并</button>
+            <span class="muted">提交后在一次事务中更新灯具、回路、接线与 Cue，并返回新草稿。</span>
+          </div>
+          <div id="merge-commit-error" class="error-line" hidden></div>
         </div>
       </div>
     </section>

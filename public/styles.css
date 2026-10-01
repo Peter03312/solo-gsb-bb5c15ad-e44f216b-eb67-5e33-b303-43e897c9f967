@@ -195,3 +195,38 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .cmp-cfg-group.only-a b { color: var(--ok); }
 .cmp-cfg-group.only-b b { color: var(--amber); }
 .danger-text { color: var(--danger); font-weight: 600; }
+
+/* 版本合并 */
+.ok-line {
+  margin-top: .6rem;
+  padding: .55rem .75rem;
+  border: 1px solid #2d5a3a;
+  background: rgba(76, 208, 125, 0.08);
+  color: var(--ok);
+  border-radius: 6px;
+  font-size: .88rem;
+  white-space: pre-line;
+}
+.merge-group { margin: .7rem 0 .3rem; font-size: .85rem; color: var(--amber-soft); }
+.merge-list { margin: .2rem 0 .4rem; padding-left: 1.2rem; }
+.merge-list li { margin: .25rem 0; }
+.merge-conflict {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .7rem .9rem;
+  margin: .6rem 0;
+}
+.merge-conflict-head { display: flex; gap: .6rem; align-items: center; margin-bottom: .55rem; }
+.merge-sides { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; }
+.merge-side {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .5rem .7rem;
+  cursor: pointer;
+}
+.merge-side:has(input:checked) { border-color: var(--amber); background: rgba(245, 185, 66, 0.05); }
+.merge-side input { margin-right: .35rem; }
+.merge-val { margin-top: .3rem; font-size: .85rem; white-space: normal; }
+.merge-warn { font-size: .8rem; margin-top: .3rem; }
+.error-line { white-space: pre-line; }

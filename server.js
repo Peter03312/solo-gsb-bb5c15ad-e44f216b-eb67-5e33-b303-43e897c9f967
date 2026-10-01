@@ -602,6 +602,172 @@ function handleCompare(req, res) {
 app.get('/api/compare', handleCompare);
 app.post('/api/compare', handleCompare);
 
+/* ---------------------- 版本三方合并（预览 / 提交） ---------------------- */
+// 两组排演从同一已发布版本各自改稿后，把另一已发布版本合入当前草稿：
+// 以共同基线版本、当前草稿、待合入版本，按灯具/回路编号、Cue 编号与灯具接线做三方比较。
+// 预览只读不写库；提交携带预览时的草稿指纹与逐项冲突选择，
+// 仍违反唯一性/引用规则则整次拒绝，草稿在预览后被编辑则要求重新预览。
+// 成功时以一次事务更新灯具、回路、接线与 Cue；已发布版本与绑定的调光记录不受影响。
+
+const Merge = require('./src/merge');
+
+function loadDraftState() {
+  return Merge.stateFromDraft({
+    lights: db.prepare('SELECT id, name, circuit_id, watts FROM lights ORDER BY id').all(),
+    circuits: db.prepare('SELECT id, name, capacity FROM circuits ORDER BY id').all(),
+    cues: db.prepare('SELECT cue_no, light_id, time, target, duration FROM cues ORDER BY cue_no').all(),
+  });
+}
+
+function readDraft() {
+  return {
+    lights: db.prepare('SELECT * FROM lights ORDER BY id ASC').all(),
+    circuits: db.prepare(circuitSelect).all().map(readCircuit),
+    cues: db.prepare(cueSelect).all().map(readCue),
+  };
+}
+
+// 解析并加载共同基线版本与待合入版本；失败时已写出错误响应并返回 null
+function parseMergeVersions(input, res) {
+  const ids = {};
+  for (const [field, label] of [
+    ['base_version', '共同基线版本'],
+    ['theirs_version', '待合入版本'],
+  ]) {
+    const id = toPosInt(input[field]);
+    if (Number.isNaN(id)) {
+      err(res, 400, `${label}编号无效：${JSON.stringify(input[field])}（须为正整数）`);
+      return null;
+    }
+    ids[field] = id;
+  }
+  const base = loadVersionSnapshot(ids.base_version);
+  if (!base) {
+    err(res, 404, `共同基线版本不存在：#${ids.base_version}`);
+    return null;
+  }
+  const theirs = ids.theirs_version === ids.base_version ? base : loadVersionSnapshot(ids.theirs_version);
+  if (!theirs) {
+    err(res, 404, `待合入版本不存在：#${ids.theirs_version}`);
+    return null;
+  }
+  return { base, theirs };
+}
+
+// 早期版本发布于回路功能之前：有灯具却没有接线快照，其回路/接线视为「无配置信息」，
+// 该两个维度不参与合并（草稿保持不变），避免把「无数据」误当作「已删除」。
+function buildMergeStates(baseSnap, theirsSnap, ours) {
+  const base = Merge.stateFromVersion(baseSnap);
+  const theirs = Merge.stateFromVersion(theirsSnap);
+  const legacy = (snap) => snap.lights.length > 0 && snap.wiring.length === 0;
+  if (legacy(baseSnap) || legacy(theirsSnap)) {
+    base.circuits = new Map(ours.circuits);
+    base.wirings = new Map(ours.wirings);
+    theirs.circuits = new Map(ours.circuits);
+    theirs.wirings = new Map(ours.wirings);
+    return { base, theirs, wiringMerged: false };
+  }
+  return { base, theirs, wiringMerged: true };
+}
+
+app.post('/api/merge/preview', (req, res) => {
+  const body = req.body || {};
+  const versions = parseMergeVersions(body, res);
+  if (!versions) return;
+
+  const ours = loadDraftState();
+  const states = buildMergeStates(versions.base, versions.theirs, ours);
+  const plan = Merge.computeMergePlan(states.base, ours, states.theirs);
+
+  res.json({
+    base: { id: versions.base.id, label: versions.base.label },
+    theirs: { id: versions.theirs.id, label: versions.theirs.label },
+    draft_fingerprint: Merge.fingerprint(ours),
+    wiring_config_merged: states.wiringMerged,
+    note: states.wiringMerged
+      ? null
+      : '基线或待合入版本发布于回路功能之前，本次合并不包含回路与接线（草稿回路配置保持不变）',
+    auto: plan.auto,
+    conflicts: plan.conflicts,
+    summary: plan.summary,
+  });
+});
+
+app.post('/api/merge/commit', (req, res) => {
+  const body = req.body || {};
+  const versions = parseMergeVersions(body, res);
+  if (!versions) return;
+
+  if (typeof body.draft_fingerprint !== 'string' || body.draft_fingerprint === '') {
+    return err(res, 400, '提交必须携带预览返回的草稿指纹 draft_fingerprint');
+  }
+  const ours = loadDraftState();
+  if (Merge.fingerprint(ours) !== body.draft_fingerprint) {
+    return res.status(409).json({
+      error: '草稿在预览后已被修改，合并计划可能已过期：请重新预览后再提交（本次未写入任何内容）',
+      code: 'draft_changed',
+    });
+  }
+
+  // 指纹一致 + 版本不可变 → 重算的合并计划与预览一致，逐项选择据此校验
+  const states = buildMergeStates(versions.base, versions.theirs, ours);
+  const plan = Merge.computeMergePlan(states.base, ours, states.theirs);
+  const applied = Merge.applyResolutions(ours, plan, body.resolutions ?? {});
+  if (applied.error) return err(res, 400, applied.error);
+
+  const violations = Merge.validateMerged(applied.merged);
+  if (violations.length > 0) {
+    return res.status(409).json({
+      error: '合并结果仍违反唯一性或引用规则，整次提交已拒绝（未写入任何内容）',
+      code: 'merge_violations',
+      violations,
+    });
+  }
+
+  // 一次事务整体写回草稿：灯具、回路、接线（随灯具行）与 Cue。
+  // 先删 Cue 再删灯具（外键），随后按合并结果整批重建；编号保持不变，已有灯具保留原创建时间。
+  const rows = Merge.stateToDraftRows(applied.merged);
+  const now = Date.now() / 1000;
+  const lightCreated = new Map(
+    db.prepare('SELECT id, created_at FROM lights').all().map((r) => [r.id, r.created_at])
+  );
+  const circuitCreated = new Map(
+    db.prepare('SELECT id, created_at FROM circuits').all().map((r) => [r.id, r.created_at])
+  );
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM cues').run();
+    db.prepare('DELETE FROM lights').run();
+    db.prepare('DELETE FROM circuits').run();
+    const insLight = db.prepare(
+      'INSERT INTO lights (id, name, created_at, circuit_id, watts) VALUES (?, ?, ?, ?, ?)'
+    );
+    for (const l of rows.lights) {
+      insLight.run(l.id, l.name, lightCreated.get(l.id) ?? now, l.circuit_id, l.watts);
+    }
+    const insCircuit = db.prepare(
+      'INSERT INTO circuits (id, name, capacity, created_at) VALUES (?, ?, ?, ?)'
+    );
+    for (const c of rows.circuits) {
+      insCircuit.run(c.id, c.name, c.capacity, circuitCreated.get(c.id) ?? now);
+    }
+    const insCue = db.prepare(
+      'INSERT INTO cues (cue_no, light_id, time, target, duration) VALUES (?, ?, ?, ?, ?)'
+    );
+    for (const c of rows.cues) insCue.run(c.cue_no, c.light_id, c.time, c.target, c.duration);
+  });
+  tx();
+
+  res.json({
+    merged: {
+      base: { id: versions.base.id, label: versions.base.label },
+      theirs: { id: versions.theirs.id, label: versions.theirs.label },
+      auto_count: plan.summary.auto_count,
+      resolved_count: plan.conflicts.length,
+    },
+    draft: readDraft(),
+  });
+});
+
 /* ------------------------- 临时调光记录（覆盖/归还） ------------------------- */
 // 记录绑定已发布版本快照：原版 Cue 始终取快照在后台运行，草稿修改与新版本发布均不影响既有记录。
 // 每次追加成功 revision + 1；提交须携带当前修订号，过期返回 409 且整次提交不写入。

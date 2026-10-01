@@ -30,7 +30,12 @@ async function api(method, url, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  if (!res.ok) {
+    const e = new Error(data.error || `请求失败（${res.status}）`);
+    e.status = res.status;
+    e.data = data; // 409 合并冲突/违规等结构化详情
+    throw e;
+  }
   return data;
 }
 
@@ -327,6 +332,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderVersions();
   renderVersionOptions(keepSelection ? prev : null);
   renderCompareOptions();
+  renderMergeOptions();
   renderRecordVersionOptions();
   renderLoadOptions();
   if (keepSelection) {
@@ -651,6 +657,196 @@ function renderCompare(d) {
     renderOnly(d.config_differences.only_in_b, `仅存在于版本 B（#${d.versions.b.id}）`, 'only-b');
   $('cmp-config').innerHTML = cfgHtml || '<p class="muted">两版灯具配置一致。</p>';
 }
+
+/* ----------------------------- 版本合并 ----------------------------- */
+// 三方合并：共同基线版本 + 当前草稿 + 待合入版本。预览不写库；
+// 逐项选择后提交，服务端重算计划、校验指纹与最终唯一性/引用规则，一次事务写回草稿。
+
+const mergeState = { plan: null };
+
+function renderMergeOptions() {
+  const make = (sel) => {
+    sel.innerHTML =
+      state.versions.length === 0
+        ? '<option value="">— 暂无已发布版本 —</option>'
+        : state.versions.map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}</option>`).join('');
+  };
+  make($('mg-base'));
+  make($('mg-theirs'));
+  // 默认基线选最早、待合入选最新（版本列表按编号倒序）
+  if (state.versions.length > 0) $('mg-theirs').value = String(state.versions[0].id);
+  if (state.versions.length > 0) $('mg-base').value = String(state.versions[state.versions.length - 1].id);
+}
+
+const MG_TYPE_LABEL = {
+  both_modified: '两侧不同修改',
+  delete_vs_modify: '删除与修改并存',
+  both_added: '同编号新增异值',
+  name_clash: '名称重名',
+  missing_reference: '引用缺失',
+};
+const MG_ACTION_LABEL = { add: '新增', update: '修改', delete: '删除' };
+
+function fmtMergeValue(kind, v) {
+  if (v === null || v === undefined) return '<span class="muted">（不存在）</span>';
+  switch (kind) {
+    case 'light':
+      return `名称「${esc(v.name)}」`;
+    case 'circuit':
+      return `「${esc(v.name)}」 · 容量 ${fmt(v.capacity)}W`;
+    case 'wiring':
+      return v.circuit_id === null || v.circuit_id === undefined
+        ? '未分配回路'
+        : `回路 #${v.circuit_id} · 额定 ${fmt(v.watts)}W`;
+    case 'cue':
+      return `灯具 #${v.light_id} · t=${fmt(v.time)}s → ${fmt(v.target)} · 渐变 ${fmt(v.duration)}s`;
+    default:
+      return esc(JSON.stringify(v));
+  }
+}
+
+function fmtMergeKey(kind, key) {
+  if (kind === 'cue') return `Cue #${key}`;
+  if (kind === 'wiring') return `灯具 #${key} 接线`;
+  if (kind === 'circuit') return `回路 #${key}`;
+  return `灯具 #${key}`;
+}
+
+$('form-merge-preview').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('merge-error'));
+  $('merge-ok').hidden = true;
+  try {
+    const plan = await api('POST', '/api/merge/preview', {
+      base_version: $('mg-base').value,
+      theirs_version: $('mg-theirs').value,
+    });
+    mergeState.plan = plan;
+    renderMergePlan(plan);
+  } catch (err) {
+    mergeState.plan = null;
+    $('merge-result').hidden = true;
+    showErr($('merge-error'), '预览失败：' + err.message);
+  }
+});
+
+function renderMergePlan(plan) {
+  $('merge-result').hidden = false;
+  clearErr($('merge-commit-error'));
+  $('merge-title').textContent =
+    `合并预览：基线 #${plan.base.id}（${plan.base.label}） ← 待合入 #${plan.theirs.id}（${plan.theirs.label}）`;
+  $('merge-summary').textContent =
+    `可自动合入 ${plan.summary.auto_count} 项，冲突 ${plan.summary.conflict_count} 项。` +
+    (plan.summary.conflict_count > 0 ? '请逐项选择后再提交。' : '没有冲突，可直接提交。');
+  $('merge-note').hidden = !plan.note;
+  if (plan.note) $('merge-note').textContent = plan.note;
+
+  // 自动改动（按维度分组）
+  const groups = [
+    ['lights', '灯具'],
+    ['circuits', '回路'],
+    ['wirings', '接线'],
+    ['cues', 'Cue'],
+  ];
+  const parts = [];
+  for (const [key, label] of groups) {
+    const list = plan.auto[key] || [];
+    if (list.length === 0) continue;
+    parts.push(`<h4 class="merge-group">${label}（${list.length}）</h4>`);
+    parts.push(
+      '<ul class="merge-list">' +
+        list
+          .map((e) => {
+            const detail =
+              e.action === 'delete'
+                ? `原值：${fmtMergeValue(e.kind, e.from)}`
+                : e.action === 'add'
+                  ? fmtMergeValue(e.kind, e.to)
+                  : `${fmtMergeValue(e.kind, e.from)} → ${fmtMergeValue(e.kind, e.to)}`;
+            return `<li><span class="badge fading">${MG_ACTION_LABEL[e.action]}</span> ` +
+              `${fmtMergeKey(e.kind, e.key)}：${detail}</li>`;
+          })
+          .join('') +
+        '</ul>'
+    );
+  }
+  $('merge-auto').innerHTML =
+    parts.join('') || '<p class="muted">没有需要自动合入的改动（两侧一致，或仅草稿有改动）。</p>';
+
+  // 冲突：逐项单选（默认保留草稿）
+  $('merge-conflicts').innerHTML =
+    plan.conflicts.length === 0
+      ? '<p class="muted">没有冲突。</p>'
+      : plan.conflicts
+          .map(
+            (c) => `
+        <div class="merge-conflict">
+          <div class="merge-conflict-head">
+            <span class="badge waiting">${MG_TYPE_LABEL[c.type] || c.type}</span>
+            <span>${esc(c.message)}</span>
+          </div>
+          <div class="merge-sides">
+            <label class="merge-side">
+              <input type="radio" name="mg-${c.id}" value="ours" checked />
+              <b>保留草稿</b>
+              <div class="merge-val">${fmtMergeValue(c.kind, c.ours)}</div>
+              ${(c.ours_warnings || []).map((w) => `<div class="danger-text merge-warn">⚠ ${esc(w)}</div>`).join('')}
+            </label>
+            <label class="merge-side">
+              <input type="radio" name="mg-${c.id}" value="theirs" />
+              <b>采用待合入版本</b>
+              <div class="merge-val">${fmtMergeValue(c.kind, c.theirs)}</div>
+              ${(c.theirs_warnings || []).map((w) => `<div class="danger-text merge-warn">⚠ ${esc(w)}</div>`).join('')}
+            </label>
+          </div>
+        </div>`
+          )
+          .join('');
+}
+
+$('btn-merge-commit').addEventListener('click', async () => {
+  const plan = mergeState.plan;
+  if (!plan) return;
+  clearErr($('merge-commit-error'));
+  const resolutions = {};
+  for (const c of plan.conflicts) {
+    const sel = document.querySelector(`input[name="mg-${c.id}"]:checked`);
+    if (!sel) {
+      return showErr($('merge-commit-error'), `请为冲突「${c.message}」选择保留草稿或采用待合入版本`);
+    }
+    resolutions[c.id] = sel.value;
+  }
+  try {
+    const d = await api('POST', '/api/merge/commit', {
+      base_version: plan.base.id,
+      theirs_version: plan.theirs.id,
+      draft_fingerprint: plan.draft_fingerprint,
+      resolutions,
+    });
+    mergeState.plan = null;
+    $('merge-result').hidden = true;
+    // 草稿已整体更新：刷新各相关页面数据
+    await Promise.all([loadLights(), loadCircuits(), loadCues()]);
+    const ok = $('merge-ok');
+    ok.textContent =
+      `合并完成：自动合入 ${d.merged.auto_count} 项、解决冲突 ${d.merged.resolved_count} 项；` +
+      `草稿现有灯具 ${d.draft.lights.length} 盏、回路 ${d.draft.circuits.length} 条、Cue ${d.draft.cues.length} 条。`;
+    ok.hidden = false;
+  } catch (err) {
+    const violations = err.data && err.data.violations;
+    if (err.data && err.data.code === 'draft_changed') {
+      // 草稿在预览后被编辑：本次预览作废，要求重新预览
+      mergeState.plan = null;
+      $('merge-result').hidden = true;
+      showErr($('merge-error'), err.message);
+      return;
+    }
+    showErr(
+      $('merge-commit-error'),
+      '提交被拒绝：' + err.message + (violations ? '\n· ' + violations.join('\n· ') : '')
+    );
+  }
+});
 
 /* ------------------------- 回路负载预判 ------------------------- */
 
@@ -1044,6 +1240,7 @@ function renderRecordOutput() {
     renderVersions();
     renderVersionOptions(null);
     renderCompareOptions();
+    renderMergeOptions();
     renderRecordVersionOptions();
     renderRecordTable();
     renderLoadOptions();
