@@ -1,9 +1,11 @@
 'use strict';
 
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const { open, get } = require('./src/db');
 const Engine = require('./public/engine');
+const Merge = require('./src/merge');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
@@ -1016,6 +1018,361 @@ function handleLoad(req, res) {
 
 app.get('/api/load', handleLoad);
 app.post('/api/load', handleLoad);
+
+/* ----------------- 草稿三方合并（预览令牌 + 一次事务提交） ----------------- */
+// 两组排演人员从同一已发布版本（base 共同基线）各自改稿：当前草稿（draft）为一方成果，
+// 另一已发布版本（incoming 待合入）按灯具/回路编号、Cue 编号、灯具接线做三方比较。
+// 预览只读并颁发一次性令牌；提交逐项抉择，草稿在预览后被编辑过则 409 要求重新预览，
+// 最终结果仍违反唯一性/引用规则则整次拒绝；成功后一次事务重写灯具/回路/接线/Cue。
+
+const PREVIEW_TTL_SECONDS = 24 * 3600;
+
+// 当前草稿按版本快照同构读出（接线来自灯具行）
+function loadDraftState() {
+  const lights = db.prepare('SELECT id, name, circuit_id, watts FROM lights ORDER BY id ASC').all();
+  const circuits = db
+    .prepare('SELECT id, name, capacity FROM circuits ORDER BY id ASC')
+    .all();
+  const cues = db
+    .prepare('SELECT cue_no, light_id, time, target, duration FROM cues ORDER BY cue_no ASC')
+    .all();
+  return {
+    lights: lights.map(({ id, name }) => ({ id, name })),
+    circuits,
+    cues,
+    wiring: lights.map((l) => ({
+      light_id: l.id,
+      circuit_id: l.circuit_id ?? null,
+      watts: l.watts ?? null,
+    })),
+  };
+}
+
+// 草稿内容版本戳：灯具/回路/Cue/接线任一变化都会改变；提交时据此判断预览后是否被编辑
+function computeDraftStamp(state) {
+  return crypto.createHash('sha256').update(JSON.stringify(state)).digest('hex');
+}
+
+// 三方快照中出现过的编号 -> 名称（重名/改名时以后遍历侧为准），仅供展示
+function buildNameCtx(base, draft, incoming) {
+  const lightNames = new Map();
+  const circuitNames = new Map();
+  for (const snap of [base, draft, incoming]) {
+    for (const l of snap.lights) lightNames.set(l.id, l.name);
+    for (const c of snap.circuits) circuitNames.set(c.id, c.name);
+  }
+  return {
+    lightName: (id) => lightNames.get(id) ?? `#${id}（该侧不存在）`,
+    circuitName: (id) => circuitNames.get(id) ?? `#${id}（该侧不存在）`,
+  };
+}
+
+function enrichValue(kind, v, ctx) {
+  if (v === null || v === undefined) return null;
+  if (kind === 'cue') {
+    return { ...v, light_name: ctx.lightName(v.light_id) };
+  }
+  if (kind === 'wiring') {
+    return {
+      ...v,
+      light_name: ctx.lightName(v.light_id),
+      circuit_name: v.circuit_id === null ? null : ctx.circuitName(v.circuit_id),
+    };
+  }
+  return { ...v };
+}
+
+function entryTitle(c) {
+  if (c.kind === 'cue') return `Cue #${c.id}`;
+  if (c.kind === 'wiring') return `灯具 #${c.id} 的接线`;
+  return `${c.label} #${c.id}`;
+}
+
+// 单条冲突原因的中文说明（name_collision / reference_missing 区分抉择侧）
+function describeReason(kind, id, r) {
+  const sideText = r.side === 'draft' ? '保留草稿侧' : '采用待合入版本侧';
+  switch (r.code) {
+    case 'both_modified':
+      return '两侧相对共同基线做了不同修改';
+    case 'delete_vs_modify':
+      return '一侧删除而另一侧做了修改（删除与修改并存）';
+    case 'same_key_diff':
+      return '同编号新增但两侧内容不同';
+    case 'name_collision':
+      return `若${sideText}，名称「${r.detail.name}」与同表另一项重名（${kind === 'light' ? '灯具' : '回路'}名称须唯一）`;
+    case 'reference_missing':
+      if (kind === 'cue') {
+        return `若${sideText}，Cue #${id} 引用的灯具 #${r.detail.missing_light_id} 在合并结果中不存在`;
+      }
+      return `若${sideText}，灯具 #${id} 的接线引用了合并结果中不存在的回路 #${r.detail.missing_circuit_id}`;
+    case 'reference_dependency': {
+      const sideText2 = r.side === 'draft' ? '保留草稿侧' : '采用待合入版本侧';
+      const who = r.detail.by_kind === 'cue' ? `Cue #${r.detail.by_id}` : `灯具 #${r.detail.by_id} 的接线`;
+      const what = kind === 'light' ? '灯具' : '回路';
+      return `若${sideText2}，${who} 引用本${what}；请与该冲突选择同一侧（删除本项则该引用无法保留）`;
+    }
+    case 'attached_to_conflict': {
+      const hostLabel = r.detail.host_kind === 'light' ? `灯具 #${r.detail.host_id}` : `回路 #${r.detail.host_id}`;
+      return `随冲突项 ${hostLabel} 一并新增：选择是否引入该${hostLabel}时此项跟随同侧处理`;
+    }
+    default:
+      return r.code;
+  }
+}
+
+function describeViolation(v) {
+  const { kind, id } = Merge.parseKey(v.key);
+  return describeReason(kind, id, { code: v.code, detail: v.detail });
+}
+
+function presentAuto(e, ctx) {
+  const actionText = {
+    add: '采用待合入版本的新增',
+    update: '采用待合入版本的修改',
+    delete: '按待合入版本删除（草稿侧未改）',
+  };
+  return {
+    kind: e.kind,
+    key: e.key,
+    id: e.id,
+    title: entryTitle(e),
+    action: e.action,
+    action_text: actionText[e.action],
+    base: enrichValue(e.kind, e.base, ctx),
+    current: enrichValue(e.kind, e.current, ctx),
+    incoming: enrichValue(e.kind, e.incoming, ctx),
+    applied: enrichValue(e.kind, e.applied, ctx),
+  };
+}
+
+function presentConflict(c, ctx) {
+  return {
+    kind: c.kind,
+    key: c.key,
+    id: c.id,
+    title: entryTitle(c),
+    reason: c.reason,
+    reason_text: describeReason(c.kind, c.id, c.reasons[0]),
+    reasons: c.reasons.map((r) => ({
+      code: r.code,
+      side: r.side || null,
+      text: describeReason(c.kind, c.id, r),
+    })),
+    base: enrichValue(c.kind, c.base, ctx),
+    draft: enrichValue(c.kind, c.draft, ctx),
+    incoming: enrichValue(c.kind, c.incoming, ctx),
+  };
+}
+
+function parseMergeVersions(body) {
+  const out = {};
+  for (const [field, label] of [
+    ['base_version_id', '共同基线版本'],
+    ['incoming_version_id', '待合入版本'],
+  ]) {
+    const id = toPosInt(body?.[field]);
+    if (Number.isNaN(id)) {
+      return { error: `${label}编号无效：${JSON.stringify(body?.[field])}（须为正整数）` };
+    }
+    out[field] = id;
+  }
+  return { value: out };
+}
+
+// POST /api/merge/preview  只读三方比较，颁发预览令牌（不写任何业务数据）
+app.post('/api/merge/preview', (req, res) => {
+  const parsed = parseMergeVersions(req.body);
+  if (parsed.error) return err(res, 400, parsed.error);
+  const { base_version_id: baseId, incoming_version_id: incomingId } = parsed.value;
+
+  const base = loadVersionSnapshot(baseId);
+  if (!base) return err(res, 404, `共同基线版本不存在：#${baseId}`);
+  const incoming =
+    incomingId === baseId ? base : loadVersionSnapshot(incomingId);
+  if (!incoming) return err(res, 404, `待合入版本不存在：#${incomingId}`);
+
+  const draftState = loadDraftState();
+  const cls = Merge.classify(base, draftState, incoming);
+  const ctx = buildNameCtx(base, draftState, incoming);
+
+  // 清理过期预览令牌
+  db.prepare('DELETE FROM merge_previews WHERE created_at < ?').run(
+    Date.now() / 1000 - PREVIEW_TTL_SECONDS
+  );
+
+  const token = crypto.randomBytes(24).toString('hex');
+  db.prepare(
+    `INSERT INTO merge_previews (token, base_id, incoming_id, draft_stamp, payload, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    token,
+    baseId,
+    incomingId,
+    computeDraftStamp(draftState),
+    JSON.stringify({ auto: cls.auto, conflicts: cls.conflicts, summary: cls.summary }),
+    Date.now() / 1000
+  );
+
+  res.json({
+    token,
+    base: { id: base.id, label: base.label },
+    incoming: { id: incoming.id, label: incoming.label },
+    draft_stamp: computeDraftStamp(draftState),
+    summary: cls.summary,
+    auto: cls.auto.map((e) => presentAuto(e, ctx)),
+    conflicts: cls.conflicts.map((c) => presentConflict(c, ctx)),
+    draft: draftState,
+  });
+});
+
+// POST /api/merge/commit  凭令牌与逐项抉择一次事务提交
+app.post('/api/merge/commit', (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token : '';
+  const row = token ? db.prepare('SELECT * FROM merge_previews WHERE token = ?').get(token) : null;
+  if (!row) {
+    return err(res, 404, '合并预览不存在或已失效：请重新发起预览（预览不写库，令牌一次性有效）');
+  }
+
+  const base = loadVersionSnapshot(row.base_id);
+  const incoming =
+    row.incoming_id === row.base_id ? base : loadVersionSnapshot(row.incoming_id);
+  if (!base || !incoming) {
+    db.prepare('DELETE FROM merge_previews WHERE token = ?').run(token);
+    return err(res, 404, '预览引用的版本已不存在，请重新预览');
+  }
+
+  // 草稿在预览后发生编辑：当前内容版本戳与预览时不一致 → 409，要求重新预览
+  const draftState = loadDraftState();
+  const currentStamp = computeDraftStamp(draftState);
+  if (currentStamp !== row.draft_stamp) {
+    db.prepare('DELETE FROM merge_previews WHERE token = ?').run(token);
+    return err(
+      res,
+      409,
+      '草稿在预览之后已被编辑，本次合并结果已过期：请重新预览并逐项抉择后再提交（本次未写入）'
+    );
+  }
+
+  const resolutions = req.body?.resolutions;
+  if (resolutions === null || typeof resolutions !== 'object' || Array.isArray(resolutions)) {
+    return err(res, 400, '提交必须携带 resolutions 抉择对象（冲突 key -> "draft" 或 "incoming"）');
+  }
+
+  const result = Merge.resolve(base, draftState, incoming, resolutions);
+  if (!result.ok) {
+    const body = { error: '合并结果仍不合法，整次提交已拒绝（未写入任何数据）' };
+    if (result.badResolutions.length > 0) {
+      body.error = `抉择内容无效：${result.badResolutions[0].key} ${result.badResolutions[0].reason}`;
+      body.bad_resolutions = result.badResolutions;
+    } else if (result.unresolved.length > 0) {
+      body.error = `仍有 ${result.unresolved.length} 个冲突未做选择，请逐项选择「保留草稿」或「采用待合入版本」后再提交`;
+      body.unresolved = result.unresolved;
+    } else if (result.violations.length > 0) {
+      body.error = '合并结果仍违反唯一性或引用规则，整次提交已拒绝：' +
+        result.violations.map(describeViolation).join('；');
+      body.violations = result.violations.map((v) => ({
+        key: v.key,
+        code: v.code,
+        detail: v.detail,
+        text: describeViolation(v),
+      }));
+    }
+    return res.status(400).json(body);
+  }
+
+  const finalState = result.final;
+  const stampExpected = row.draft_stamp;
+
+  const applyMerge = db.transaction(() => {
+    // 事务内再次确认草稿未被并发改动（双保险）
+    if (computeDraftStamp(loadDraftState()) !== stampExpected) {
+      const e = new Error('DRAFT_CHANGED');
+      e.code = 'DRAFT_CHANGED';
+      throw e;
+    }
+
+    const keepLightIds = new Set(finalState.lights.map((l) => l.id));
+    const keepCircuitIds = new Set(finalState.circuits.map((c) => c.id));
+    const keepCueNos = new Set(finalState.cues.map((c) => c.cue_no));
+
+    // 1) 灯具：先 upsert（Cue 外键需要），最后删除不再保留的
+    const upsertLight = db.prepare(
+      `INSERT INTO lights (id, name, created_at) VALUES (?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET name = excluded.name`
+    );
+    for (const l of finalState.lights) {
+      upsertLight.run(l.id, l.name, Date.now() / 1000);
+    }
+
+    // 2) Cue：删除待移除编号，upsert 保留项（编号即业务身份，保持稳定）
+    db.prepare('DELETE FROM cues WHERE cue_no NOT IN (SELECT value FROM json_each(?))').run(
+      JSON.stringify([...keepCueNos])
+    );
+    const upsertCue = db.prepare(
+      `INSERT INTO cues (cue_no, light_id, time, target, duration) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (cue_no) DO UPDATE SET
+         light_id = excluded.light_id, time = excluded.time,
+         target = excluded.target, duration = excluded.duration`
+    );
+    for (const c of finalState.cues) {
+      upsertCue.run(c.cue_no, c.light_id, c.time, c.target, c.duration);
+    }
+
+    // 3) 删除不再保留的灯具（其 Cue 已随上面的投影结果移除）
+    db.prepare('DELETE FROM lights WHERE id NOT IN (SELECT value FROM json_each(?))').run(
+      JSON.stringify([...keepLightIds])
+    );
+
+    // 4) 接线：逐灯落定所属回路与额定瓦数
+    const setWiring = db.prepare(
+      'UPDATE lights SET circuit_id = ?, watts = ? WHERE id = ?'
+    );
+    for (const w of finalState.wiring) {
+      setWiring.run(w.circuit_id, w.watts, w.light_id);
+    }
+
+    // 5) 回路：upsert 保留项，删除不再保留的（最终接线已不再引用它们）
+    const upsertCircuit = db.prepare(
+      `INSERT INTO circuits (id, name, capacity, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET name = excluded.name, capacity = excluded.capacity`
+    );
+    for (const c of finalState.circuits) {
+      upsertCircuit.run(c.id, c.name, c.capacity, Date.now() / 1000);
+    }
+    db.prepare('DELETE FROM circuits WHERE id NOT IN (SELECT value FROM json_each(?))').run(
+      JSON.stringify([...keepCircuitIds])
+    );
+
+    // 6) 令牌一次性使用
+    db.prepare('DELETE FROM merge_previews WHERE token = ?').run(token);
+  });
+
+  try {
+    applyMerge();
+  } catch (e) {
+    if (e.code === 'DRAFT_CHANGED') {
+      return err(res, 409, '草稿在提交时已被他人编辑，请重新预览后再提交（本次未写入）');
+    }
+    // 兜底：唯一性/外键等约束未被前置校验覆盖时，整次回滚并返回可读中文错误
+    if (String(e.message || '').includes('UNIQUE') || String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
+      return err(res, 400, `合并结果违反数据库唯一/引用约束，整次提交已拒绝：${e.message}（未写入任何数据）`);
+    }
+    throw e;
+  }
+
+  // 返回合并后的新草稿（已发布版本与绑定的调光记录均不变）
+  res.json({
+    merged: true,
+    base: { id: base.id, label: base.label },
+    incoming: { id: incoming.id, label: incoming.label },
+    summary: result.summary,
+    draft: {
+      lights: db.prepare('SELECT * FROM lights ORDER BY id ASC').all(),
+      circuits: db.prepare(circuitSelect).all().map(readCircuit),
+      cues: db.prepare(cueSelect).all().map(readCue),
+    },
+  });
+});
 
 /* ------------------------------- 错误处理 ------------------------------ */
 

@@ -329,6 +329,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderCompareOptions();
   renderRecordVersionOptions();
   renderLoadOptions();
+  renderMergeOptions();
   if (keepSelection) {
     if (state.versions.some((v) => String(v.id) === String(prevA))) $('cmp-version-a').value = prevA;
     if (state.versions.some((v) => String(v.id) === String(prevB))) $('cmp-version-b').value = prevB;
@@ -1025,6 +1026,175 @@ function renderRecordOutput() {
     })
     .join('');
 }
+
+/* ----------------------------- 版本合并 ----------------------------- */
+
+state.merge = null; // 当前预览结果
+
+function renderMergeOptions() {
+  const make = (sel) => {
+    if (state.versions.length === 0) {
+      sel.innerHTML = '<option value="">— 暂无已发布版本 —</option>';
+      return;
+    }
+    sel.innerHTML = state.versions
+      .map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}</option>`)
+      .join('');
+  };
+  make($('merge-base'));
+  make($('merge-incoming'));
+  // 默认基线选次新、待合入选最新（两组各自改稿后发布的典型顺序）
+  if (state.versions.length > 0) $('merge-incoming').value = String(state.versions[0].id);
+  if (state.versions.length > 1) $('merge-base').value = String(state.versions[1].id);
+}
+
+function formatMergeValue(kind, v) {
+  if (v === null || v === undefined) return '<span class="badge waiting">— 已删除 —</span>';
+  if (kind === 'light') return `名称：${esc(v.name)}`;
+  if (kind === 'circuit') return `名称：${esc(v.name)}；容量：${fmt(v.capacity)} W`;
+  if (kind === 'cue') {
+    return `灯具：#${v.light_id} ${esc(v.light_name || '')}；时码：${fmt(v.time)}s；` +
+      `目标：${fmt(v.target)}；渐变：${fmt(v.duration)}s`;
+  }
+  if (v.circuit_id === null) return '未分配回路（不计入负载）';
+  return `回路：#${v.circuit_id} ${esc(v.circuit_name || '')}；额定：${fmt(v.watts)} W`;
+}
+
+function actionBadge(action, text) {
+  const cls = action === 'delete' ? 'danger-text' : '';
+  return `<span class="${cls}">${esc(text)}</span>`;
+}
+
+$('form-merge-preview').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('merge-error'));
+  const body = {
+    base_version_id: $('merge-base').value,
+    incoming_version_id: $('merge-incoming').value,
+  };
+  try {
+    state.merge = await api('POST', '/api/merge/preview', body);
+    renderMergePreview();
+  } catch (err2) {
+    state.merge = null;
+    $('merge-workspace').hidden = true;
+    showErr($('merge-error'), '预览失败：' + err2.message);
+  }
+});
+
+function renderMergePreview() {
+  const m = state.merge;
+  $('merge-workspace').hidden = false;
+  clearErr($('merge-commit-error'));
+  $('merge-title').textContent =
+    `合并预览：基线 #${m.base.id}（${m.base.label}） → 合入 #${m.incoming.id}（${m.incoming.label}）`;
+  $('merge-meta').textContent =
+    `自动合入 ${m.summary.auto_total} 项` +
+    `（新增 ${m.summary.auto_add} / 修改 ${m.summary.auto_update} / 删除 ${m.summary.auto_delete}），` +
+    `冲突 ${m.summary.conflicts_total} 项。预览只读，尚未改动草稿。`;
+
+  $('merge-auto-table').querySelector('tbody').innerHTML = m.auto
+    .map(
+      (a) => `
+      <tr>
+        <td>${esc(a.title)}</td>
+        <td>${actionBadge(a.action, a.action_text)}</td>
+        <td class="merge-side">${formatMergeValue(a.kind, a.base)}</td>
+        <td class="merge-side">${formatMergeValue(a.kind, a.current)}</td>
+        <td class="merge-side">${formatMergeValue(a.kind, a.incoming)}</td>
+        <td class="merge-side"><b>${formatMergeValue(a.kind, a.applied)}</b></td>
+      </tr>`
+    )
+    .join('');
+  $('merge-no-auto').hidden = m.auto.length > 0;
+
+  const box = $('merge-conflicts');
+  if (m.conflicts.length === 0) {
+    box.innerHTML = '';
+    $('merge-no-conflict').hidden = false;
+    return;
+  }
+  $('merge-no-conflict').hidden = true;
+  box.innerHTML = m.conflicts
+    .map(
+      (c, idx) => {
+        const warn = (side) =>
+          c.reasons
+            .filter((r) => r.side === side)
+            .map((r) => `<li class="danger-text">⚠ ${esc(r.text)}</li>`)
+            .join('');
+        return `
+        <div class="merge-conflict" data-conflict-index="${idx}">
+          <div class="merge-conflict-head">
+            <b>${esc(c.title)}</b>
+            <span class="muted">${esc(c.reason_text)}</span>
+          </div>
+          <div class="merge-conflict-cols">
+            <label class="merge-choice ${c.draft === null ? 'is-deleted' : ''}">
+              <input type="radio" name="merge-choice-${idx}" value="draft" />
+              <div>
+                <div class="merge-choice-label">保留草稿</div>
+                <div class="merge-side">${formatMergeValue(c.kind, c.draft)}</div>
+                <ul class="merge-warns">${warn('draft')}</ul>
+              </div>
+            </label>
+            <label class="merge-choice ${c.incoming === null ? 'is-deleted' : ''}">
+              <input type="radio" name="merge-choice-${idx}" value="incoming" />
+              <div>
+                <div class="merge-choice-label">采用待合入版本</div>
+                <div class="merge-side">${formatMergeValue(c.kind, c.incoming)}</div>
+                <ul class="merge-warns">${warn('incoming')}</ul>
+              </div>
+            </label>
+          </div>
+        </div>`;
+      }
+    )
+    .join('');
+}
+
+$('btn-merge-commit').addEventListener('click', async () => {
+  const m = state.merge;
+  if (!m) return;
+  clearErr($('merge-commit-error'));
+
+  const resolutions = {};
+  const unanswered = [];
+  m.conflicts.forEach((c, idx) => {
+    const picked = document.querySelector(`input[name="merge-choice-${idx}"]:checked`);
+    if (!picked) unanswered.push(c.title);
+    else resolutions[c.key] = picked.value;
+  });
+  if (unanswered.length > 0) {
+    return showErr(
+      $('merge-commit-error'),
+      `还有 ${unanswered.length} 个冲突未选择：${unanswered.slice(0, 5).join('、')}${
+        unanswered.length > 5 ? ' 等' : ''
+      }`
+    );
+  }
+
+  try {
+    const d = await api('POST', '/api/merge/commit', { token: m.token, resolutions });
+    state.merge = null;
+    $('merge-workspace').hidden = true;
+    // 用合并后的新草稿刷新各页
+    await loadLights();
+    await loadCircuits();
+    await loadCues();
+    await loadVersions({ keepSelection: false });
+    alert(
+      `合并成功：自动合入 ${d.summary.auto_total} 项，冲突已全部按抉择处理。` +
+      '当前草稿已更新；已发布版本与调光记录保持不变。'
+    );
+  } catch (err2) {
+    if (/重新预览/.test(err2.message)) {
+      state.merge = null;
+      $('merge-workspace').hidden = true;
+    }
+    showErr($('merge-commit-error'), '合并提交失败：' + err2.message);
+  }
+});
 
 /* ----------------------------- 启动 ----------------------------- */
 

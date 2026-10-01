@@ -67,6 +67,35 @@
 - **明确拒绝**：非正数容量、非正数额定瓦数、引用不存在的回路、负数/非数字时窗、起点大于终点、
   查看时刻越界、分析目标缺失或同时给出版本与记录等，均返回 `400/404` 中文错误且**不部分保存**。
 
+## 草稿三方合并（把另一已发布版本合入当前草稿）
+
+两组排演人员从**同一已发布版本**分别改稿后，可把另一组发布的版本合入当前草稿：
+
+- **输入**：`base_version_id`（两组共同的基线版本）与 `incoming_version_id`（另一组发布的
+  待合入版本）；当前草稿（draft）为其中一方的成果。
+- **比较维度**：按**灯具/回路编号、Cue 编号、灯具接线**（灯具→回路、额定瓦数）做三方比较。
+- **自动合入**：仅一侧改动（待合入侧的新增/修改/删除，草稿侧未动）、或两侧改成相同内容。
+  草稿侧自身的改动保持现状。
+- **列为冲突**（页面可逐项选择**保留草稿**或**采用待合入版本**）：
+  - 两侧相对基线做了**不同修改**；
+  - **删除与修改并存**（一侧删除、另一侧改名/改值）；
+  - **同编号新增异值**（两侧都新增了同一编号但内容不同）；
+  - **名称重名**（灯具名称、回路名称唯一；会在会导致重名的那一侧标注警示）；
+  - **Cue 引用缺失**（Cue 引用的灯具在合并结果中不存在）；
+  - **接线引用缺失**（接线指向的回路在合并结果中不存在）；
+  - Cue/接线所依赖的灯具/回路在另一侧被删除时，被引用实体作为**联动冲突**一并列出，
+    需与引用方选择同一侧；随冲突灯具新增的接线等**附着项**自动跟随主体同侧。
+- **预览不写库**：`POST /api/merge/preview` 只读比较并返回自动改动、冲突两侧值与一次性
+  预览令牌（`token`）。
+- **提交规则**：`POST /api/merge/commit` 携带令牌与逐项 `resolutions`。
+  - 草稿在预览之后被编辑过（灯具/回路/接线/Cue 任一变化）→ **409**，令牌作废，须重新预览；
+  - 仍有冲突未选择、抉择值非法、或最终结果仍违反唯一性/引用规则 → **400 整次拒绝**，不写入；
+  - 通过后以**一次事务**重写灯具、回路、接线和 Cue，返回合并后的新草稿；
+  - **已发布版本及绑定它们的调光记录不变**（快照不可变）。
+- 预览令牌有效期 24 小时，成功提交后立即失效（一次性）。
+
+调用示例见下文「草稿合并 HTTP API」。
+
 ## 一键启动（Docker Compose）
 
 需要 Docker 与 Docker Compose 插件。在本目录执行：
@@ -142,6 +171,10 @@ npm test                  # 运行灯光渐变引擎单元测试
 7. **回路负载**：在「回路负载」页选择已发布版本或某条调光记录，输入非负时窗与窗内查看时刻，
    页面显示该时刻各回路容量/负载/余量与超载标记，并精确列出时窗内严格超出容量的连续区间
    （`[ ]`/`( )` 标明端点是否包含）。分析只读，草稿与回路配置的后续改动不影响已冻结版本。
+8. **版本合并**：在「版本合并」页选择共同基线版本与另一组发布的待合入版本，点击三方比较预览：
+   页面分区列出**可自动合入的单侧改动**与**冲突**；每条冲突用单选选择「保留草稿」或
+   「采用待合入版本」（会导致重名或引用缺失的一侧有红色警示；联动冲突需与引用方同侧）。
+   提交后以一次事务更新草稿；若预览后草稿被改过会提示重新预览。已发布版本与调光记录不变。
 
 ## 回路与接线 HTTP API
 
@@ -371,6 +404,129 @@ curl 'http://localhost:3000/api/records/1/output?at=9'
   时码早于末项、归还携带目标亮度、缺少修订号 → 400；修订号过期 → 409。
   批量追加时任一条非法则整批拒绝（**不部分写入**）。
 
+## 草稿合并 HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/merge/preview` | 三方比较预览（**只读，不写库**），返回一次性预览令牌 |
+| POST | `/api/merge/commit` | 凭令牌与逐项抉择提交，一次事务更新草稿 |
+
+### 1) 预览
+
+请求体：
+
+| 字段 | 含义 |
+| --- | --- |
+| `base_version_id` | 共同基线版本编号（正整数，不存在返回 404） |
+| `incoming_version_id` | 待合入版本编号（正整数，不存在返回 404；可与基线相同） |
+
+```bash
+curl -X POST http://localhost:3000/api/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version_id":1,"incoming_version_id":2}'
+```
+
+返回（节选）：
+
+```json
+{
+  "token": "1f2c…（24 字节十六进制预览令牌，提交时原样带回）",
+  "base": {"id": 1, "label": "共同基线"},
+  "incoming": {"id": 2, "label": "B组改稿"},
+  "draft_stamp": "草稿内容版本戳（提交时服务器自行比对）",
+  "summary": {"auto_total": 2, "auto_add": 0, "auto_update": 1, "auto_delete": 1, "conflicts_total": 1},
+  "auto": [
+    {
+      "kind": "circuit", "key": "circuit:1", "id": 1, "title": "回路 #1",
+      "action": "update", "action_text": "采用待合入版本的修改",
+      "base": {"id": 1, "name": "面光回路", "capacity": 1500},
+      "current": {"id": 1, "name": "面光回路", "capacity": 1500},
+      "incoming": {"id": 1, "name": "面光回路", "capacity": 2000},
+      "applied": {"id": 1, "name": "面光回路", "capacity": 2000}
+    },
+    {
+      "kind": "cue", "key": "cue:1", "id": 1, "title": "Cue #1",
+      "action": "delete", "action_text": "按待合入版本删除（草稿侧未改）",
+      "base": {"cue_no": 1, "light_id": 1, "light_name": "面光1", "time": 0, "target": 50, "duration": 0},
+      "current": { /* 草稿侧当前值 */ },
+      "incoming": null,
+      "applied": null
+    }
+  ],
+  "conflicts": [
+    {
+      "kind": "cue", "key": "cue:2", "id": 2, "title": "Cue #2",
+      "reason": "both_modified",
+      "reason_text": "两侧相对共同基线做了不同修改",
+      "reasons": [{"code": "both_modified", "side": null, "text": "两侧相对共同基线做了不同修改"}],
+      "base": { /* … */ },
+      "draft": {"cue_no": 2, "light_id": 2, "light_name": "侧光L", "time": 2, "target": 80, "duration": 3},
+      "incoming": {"cue_no": 2, "light_id": 2, "light_name": "侧光R", "time": 2, "target": 90, "duration": 1}
+    }
+  ],
+  "draft": { "lights": [], "circuits": [], "cues": [], "wiring": [] }
+}
+```
+
+条目类型 `kind`：`light`（灯具，按编号匹配名称）、`circuit`（回路，按编号匹配名称/容量）、
+`cue`（Cue，按 Cue 编号匹配灯具/时码/目标/渐变）、`wiring`（接线，按灯具编号匹配
+所属回路 `circuit_id`（`null`=未分配）与额定瓦数 `watts`）。
+冲突原因 `reason`：
+
+| code | 含义 |
+| --- | --- |
+| `both_modified` | 两侧不同修改 |
+| `delete_vs_modify` | 删除与修改并存 |
+| `same_key_diff` | 同编号新增异值 |
+| `name_collision` | 该侧取值会造成灯具/回路名称重名（`reasons[].side` 标明是哪一侧） |
+| `reference_missing` | 该侧取值下 Cue 引用的灯具、或接线引用的回路缺失 |
+| `reference_dependency` | 联动冲突：Cue/接线需要本灯具/回路，须与引用方同侧 |
+| `attached_to_conflict` | 随冲突主体新增的接线等，提交时自动跟随主体同侧 |
+
+### 2) 提交
+
+请求体：
+
+| 字段 | 含义 |
+| --- | --- |
+| `token` | 预览返回的一次性令牌 |
+| `resolutions` | 冲突抉择对象：`"冲突 key" → "draft"（保留草稿）/ "incoming"（采用待合入版本）`；自动改动无需列出 |
+
+```bash
+# cue:2 两侧改成了不同内容 → 保留草稿侧；自动项（回路容量→2000、删除 cue1）直接生效
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"1f2c…","resolutions":{"cue:2":"draft"}}'
+```
+
+成功返回 `200` 与合并后的新草稿：
+
+```json
+{
+  "merged": true,
+  "base": {"id": 1, "label": "共同基线"},
+  "incoming": {"id": 2, "label": "B组改稿"},
+  "summary": {"auto_total": 2, "auto_update": 1, "auto_delete": 1, "conflicts_total": 1},
+  "draft": {
+    "lights": [ {"id": 1, "name": "面光A", "circuit_id": 1, "watts": 300} ],
+    "circuits": [ {"id": 1, "name": "面光回路", "capacity": 2000} ],
+    "cues": [ {"id": 12, "cue_no": 2, "light_id": 2, "light_name": "侧光L", "time": 2, "target": 80, "duration": 3} ]
+  }
+}
+```
+
+错误情形（均不写入）：
+
+- `400`：缺少/非法版本编号、`resolutions` 不是对象、引用了预览中不存在的 key、抉择值不是
+  `draft`/`incoming`、仍有冲突未选择（返回 `unresolved`）、最终结果违反唯一性或引用规则
+  （返回 `violations` 及其中文说明）。
+- `404`：预览令牌不存在或已用过（一次性）/已过期（24 小时）。
+- `409`：**草稿在预览后被编辑**——令牌作废，返回
+  `草稿在预览之后已被编辑，本次合并结果已过期：请重新预览并逐项抉择后再提交（本次未写入）`，
+  前端应重新发起预览。
+
+已发布版本（含基线与待合入版本）以及绑定它们的调光记录在合并全程**不变**。
+
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -398,22 +554,26 @@ curl 'http://localhost:3000/api/records/1/output?at=9'
 | DELETE | `/api/records/:id` | 删除记录及其操作 |
 | POST | `/api/records/:id/ops` | 追加覆盖/归还操作（携带修订号，单条或批量，整批事务） |
 | GET | `/api/records/:id/output` | 查询某时刻逐灯原版亮度与实际输出，只读重算 |
+| POST | `/api/merge/preview` | 草稿三方合并预览（共同基线 + 待合入版本），只读，返回令牌/自动改动/冲突两侧值 |
+| POST | `/api/merge/commit` | 凭预览令牌与逐项抉择提交，一次事务更新灯具/回路/接线/Cue |
 
 所有错误返回 `400/404/409` 与形如 `{"error": "具体中文原因"}` 的 JSON。
 
 ## 目录结构
 
 ```
-server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析
-src/db.js            SQLite 初始化与表结构（含调光记录、操作序列、回路与版本回路快照表，含旧库迁移）
+server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析、草稿三方合并（预览令牌/一次事务提交）
+src/db.js            SQLite 初始化与表结构（含调光记录、操作序列、回路与版本回路快照表、合并预览令牌表，含旧库迁移）
+src/merge.js         草稿三方合并纯函数（按灯具/回路/Cue/接线分类自动项与冲突、重名与引用校验、抉择落地）
 public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间、覆盖/归还重算、回路负载二次精确求根）
-public/index.html    单页界面
+public/index.html    单页界面（含版本合并页）
 public/styles.css    剧场暗色主题
-public/app.js        前端交互、版本比对页、播放器、调光记录页与回路负载页（基于 requestAnimationFrame 的播放、快照本地重算）
+public/app.js        前端交互、版本比对页、播放器、调光记录页、回路负载页与版本合并页（基于 requestAnimationFrame 的播放、快照本地重算）
 test/engine.test.js  渐变规则单元测试
 test/compare.test.js 两版亮度差区间单元测试（交点精度、端点包含性、瞬变、接管）
 test/override.test.js 覆盖/归还单元测试（渐变起点、同秒顺序、中途接管、0 秒立即生效、归还融合）
 test/circuit-load.test.js 回路负载单元测试（线性/二次超载求根、端点包含性、瞬变、多灯加权、未分配、零长度）
+test/merge.test.js   草稿三方合并单元测试（单侧自动合入、两侧异改/删除修改并存/同编号异值、重名、Cue/接线引用缺失、联动冲突、整次拒绝）
 Dockerfile           镜像构建（依赖、初始化、启动）
 docker-compose.yml   一键编排
 ```

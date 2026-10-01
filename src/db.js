@@ -104,6 +104,18 @@ CREATE TABLE IF NOT EXISTS record_ops (
 );
 
 CREATE INDEX IF NOT EXISTS idx_record_ops ON record_ops (record_id, seq);
+
+-- 草稿合并预览令牌：预览不写库，提交时凭令牌校验抉择并确认草稿未被改动
+CREATE TABLE IF NOT EXISTS merge_previews (
+  token        TEXT PRIMARY KEY,
+  base_id      INTEGER NOT NULL REFERENCES versions(id),
+  incoming_id  INTEGER NOT NULL REFERENCES versions(id),
+  -- 生成预览时草稿内容（灯具/回路/Cue/接线）的版本戳；提交时须与当前一致
+  draft_stamp  TEXT NOT NULL,
+  -- 预览给出的自动改动与冲突（JSON），提交时复核抉择只能引用其中的冲突项
+  payload      TEXT NOT NULL,
+  created_at   REAL NOT NULL
+);
 `;
 
 let db;

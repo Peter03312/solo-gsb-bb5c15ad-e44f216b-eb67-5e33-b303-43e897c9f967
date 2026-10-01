@@ -17,6 +17,7 @@
       <button class="tab" data-tab="lights">灯具录入</button>
       <button class="tab" data-tab="cues">草稿 Cue</button>
       <button class="tab" data-tab="publish">发布版本</button>
+      <button class="tab" data-tab="merge">版本合并</button>
     </nav>
   </header>
 
@@ -387,6 +388,65 @@
             <thead><tr><th>#</th><th>备注</th><th>发布时间</th><th>Cue 数</th></tr></thead>
             <tbody></tbody>
           </table>
+        </div>
+      </div>
+    </section>
+    <!-- ============================ 版本合并 ============================ -->
+    <section id="tab-merge" class="tab-panel">
+      <div class="card">
+        <h2>把另一已发布版本合入当前草稿（三方合并）</h2>
+        <p class="muted">
+          两组排演人员从<strong>同一已发布版本</strong>分别改稿：选择当时的<strong>共同基线版本</strong>
+          与另一组发布的<strong>待合入版本</strong>，系统按<strong>灯具/回路编号、Cue 编号、灯具接线</strong>
+          做三方比较并给出预览（<strong>预览不写库</strong>）。仅一侧改动或两侧改成相同内容会
+          <strong>自动合入</strong>；两侧不同改动、删除与修改并存、同编号新增异值、名称重名、
+          Cue/接线引用缺失均列为<strong>冲突</strong>，可逐项选择<strong>保留草稿</strong>或
+          <strong>采用待合入版本</strong>。提交后若仍违反唯一性或引用规则将<strong>整次拒绝</strong>；
+          预览后草稿若被编辑，会返回冲突并要求重新预览。成功后一次事务更新灯具、回路、接线和 Cue；
+          已发布版本及绑定的调光记录均不变。
+        </p>
+        <form id="form-merge-preview" class="inline-form">
+          <label>共同基线版本
+            <select id="merge-base" required style="min-width:16rem"></select>
+          </label>
+          <label>待合入版本
+            <select id="merge-incoming" required style="min-width:16rem"></select>
+          </label>
+          <button class="primary" type="submit">🔍 三方比较预览</button>
+        </form>
+        <div id="merge-error" class="error-line" hidden></div>
+      </div>
+
+      <div id="merge-workspace" hidden>
+        <div class="card">
+          <h2 id="merge-title">合并预览</h2>
+          <p class="muted" id="merge-meta"></p>
+          <h3>可自动合入的改动</h3>
+          <p class="muted">下列改动只发生在待合入版本一侧（或两侧已改成相同内容），提交时自动生效。</p>
+          <div class="table-wrap">
+            <table id="merge-auto-table">
+              <thead>
+                <tr><th>项目</th><th>动作</th><th>基线值</th><th>当前草稿</th><th>待合入版本</th><th>合入后</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="merge-no-auto" class="muted" hidden>没有需要自动合入的单侧改动。</p>
+        </div>
+
+        <div class="card">
+          <h3>冲突（须逐项选择）</h3>
+          <p class="muted">每条冲突选择一侧取值；若某一侧取值会导致重名或引用缺失，该侧下方会明确标注。</p>
+          <div id="merge-conflicts"></div>
+          <p id="merge-no-conflict" class="muted" hidden>没有冲突，可以直接提交。</p>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <button id="btn-merge-commit" class="primary">✅ 按上述抉择提交合并（一次事务）</button>
+            <span class="muted">提交后以新草稿替换当前灯具、回路、接线与 Cue；已发布版本与调光记录不变。</span>
+          </div>
+          <div id="merge-commit-error" class="error-line" hidden></div>
         </div>
       </div>
     </section>

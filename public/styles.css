@@ -195,3 +195,31 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .cmp-cfg-group.only-a b { color: var(--ok); }
 .cmp-cfg-group.only-b b { color: var(--amber); }
 .danger-text { color: var(--danger); font-weight: 600; }
+
+/* 版本合并 */
+.merge-side { font-size: .84rem; color: var(--text); min-width: 11rem; }
+.merge-conflict {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .7rem .9rem;
+  margin: .7rem 0;
+  background: #14121d;
+}
+.merge-conflict-head { display: flex; gap: .7rem; align-items: baseline; margin-bottom: .5rem; flex-wrap: wrap; }
+.merge-conflict-cols { display: flex; gap: .8rem; flex-wrap: wrap; }
+.merge-choice {
+  display: flex;
+  gap: .55rem;
+  align-items: flex-start;
+  flex: 1 1 20rem;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+  padding: .55rem .7rem;
+  cursor: pointer;
+  background: #191626;
+}
+.merge-choice:hover { border-color: var(--amber); }
+.merge-choice.is-deleted { opacity: .75; }
+.merge-choice input { margin-top: .25rem; }
+.merge-choice-label { font-weight: 600; color: var(--amber-soft); margin-bottom: .25rem; }
+.merge-warns { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .8rem; }
